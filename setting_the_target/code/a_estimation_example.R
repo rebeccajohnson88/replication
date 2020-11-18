@@ -32,134 +32,175 @@ library(rvest)
 
 ## Constants
 OUTPUT_NAME= "PalWaldfogel_output.txt"
+
+## Can either read raw data/clean or read in cleaned data
 READ_RAW_DATA = TRUE
 RAW_DATA_NAME = "cps_00040.dta"
-sink(sprintf("output/%s", output_name))
-print("Output from replication of Pal and Waldfogel")
+CLEAN_DATA_NAME = "pw_analytic.csv"
 
-
-
-## Prep the main data file on women ages 25-44
-data <- read.dta13("data/cps_00040.dta",
-                   convert.factors = F)
-
-# Make a data frame of the replicate weights used for variance estimation
-rep_weights <- data %>% select(pernum, starts_with("repwtp"))
-
-# Function to open your default browser to check below codes
-# of values
+# Function to open your default browser to check when
+# coding cps vars
 lookup_cpsvar_inbrowser <- function(varname){
   browseURL(sprintf("https://cps.ipums.org/cps-action/variables/%s#codes_section",
                     varname))
 }
 
-d_all <- data %>%
+
+## Initiate output file
+sink(sprintf("output/%s", output_name))
+print("Output from replication of Pal and Waldfogel")
+
+
+###################################
+# Prep the main data file on women 
+# ages 25-44 
+###################################
+
+if(READ_RAW_DATA){
   
-  ## Filter to observations with person-level weight > 0 
-  ## (all in this case but may differ across waves)
-  filter(asecwt > 0) %>%
-  mutate(derived_num_original = n()) %>%
+  ## Read in stata file
+  data <- read.dta13(sprintf("data/%s", RAW_DATA_NAME),
+                     convert.factors = F)
   
-  ## Filter to 25-44 (inclusive) and sex == female (2) 
-  filter(age >= 25 & age <= 44 & sex == 2) %>%
-  mutate(derived_num_demographic = n()) %>%
+  # Make a data frame of the replicate weights used for variance estimation
+  rep_weights <- data %>% select(pernum, starts_with("repwtp"))
   
-  ## Mark missing incomes
-  ### classwly is job codes (https://cps.ipums.org/cps-action/variables/CLASSWLY#codes_section)
-  ## and >14 are wage/salary jobs
-  mutate(derived_incwage = case_when(classwly > 14 ~ incwage,
-                             TRUE ~ NA_integer_), 
-  ### Even for those with jobs in those categories, set to missing if has
-  ### missing codes for those wages
-         derived_incwage = case_when(derived_incwage != 9999999 & derived_incwage != 9999998 ~ derived_incwage,
-                     TRUE ~ NA_integer_),
-  
-  ## Weeks worked last year
-  ### For the other years, we can just use wkswork1, which is the continuous report
-  derived_wkswork1 = ifelse(wkswork1 <= 0, NA, wkswork1),
-  
-  ### Usual hours per week worked last year
-  derived_uhrsworkly = ifelse(uhrsworkly != 999, uhrsworkly, NA),
-  
-  ## Create hourly wages as total income/wage divided by # of weeks x usual weekly hours
-  derived_wage = derived_incwage / (derived_wkswork1 * derived_uhrsworkly),
-  
-  ## Truncate log wage at 1st and 99th percentile
-  derived_ln_wage = log(case_when(derived_wage < quantile(derived_wage, .01, na.rm = T) ~ quantile(derived_wage, .01, na.rm = T),
-                          derived_wage > quantile(derived_wage, .99, na.rm = T) ~ quantile(derived_wage, .99, na.rm = T),
-                          T ~ derived_wage)),
-  ## Create controls
-  
-  ### Code education into four levels 
-  derived_educ = factor(ifelse(educ == 1 | educ == 999, NA,
-                         ## Less than high school
-                         ifelse(educ <= 60 | educ == 71, 1,
-                                ## HS degree (include diploma unclear 72)
-                                ifelse(educ == 70 | educ == 72 | educ == 73, 2,
-                                       ## Some college
-                                       ifelse(educ < 110, 3,
-                                              ## College or more
-                                              4))))),
+  d_clean <- data %>%
     
-  ### Family status is whether married with spouse present (TRUE),
-  ### other categories (FALSE) or NA
-  derived_married = ifelse(marst == 9, NA, marst == 1),
+    # Create different flags to filter sample
     
-  ### Race is white black or other, with later including mixed race
-  derived_race = factor(ifelse(race == 100, 1,
-                         ifelse(race == 200, 2, 3)),
-                  labels = c("White","Black","Other")),
+    ### Flags to filter to observations with person-level weight > 0 
+    ### (all in this case but may differ across waves) and
+    ### Filter to 25-44 (inclusive) and sex == female (2) 
+    mutate(filter_isposweight = asecwt > 0,
+           filter_indemrange = age >= 25 & age <= 44 & sex == 2) %>%
+    
+    ## apply filter before calculating income quantiles
+    filter(filter_isposweight & filter_indemrange) %>%
   
-  ## Mother is TRUE if nchild > 0, false otherwise
-  derived_mother = (nchild > 0)) 
+    ## Mark missing incomes
+    ### classwly is job codes (https://cps.ipums.org/cps-action/variables/CLASSWLY#codes_section)
+    ## and >14 are wage/salary jobs
+    mutate(derived_incwage = case_when(classwly > 14 ~ incwage,
+                                       TRUE ~ NA_integer_), 
+           ### Even for those with jobs in those categories, set to missing if has
+           ### missing codes for those wages
+           derived_incwage = case_when(derived_incwage != 9999999 & derived_incwage != 9999998 ~ derived_incwage,
+                                       TRUE ~ NA_integer_),
+           
+           ## Weeks worked last year
+           ### For the other years, we can just use wkswork1, which is the continuous report
+           derived_wkswork1 = ifelse(wkswork1 <= 0, NA, wkswork1),
+           
+           ### Usual hours per week worked last year
+           derived_uhrsworkly = ifelse(uhrsworkly != 999, uhrsworkly, NA),
+           
+           ## Create hourly wages as total income/wage divided by # of weeks x usual weekly hours
+           derived_wage = derived_incwage / (derived_wkswork1 * derived_uhrsworkly),
+           
+           ## Truncate log wage at 1st and 99th percentile
+           derived_ln_wage = log(case_when(derived_wage < quantile(derived_wage, .01, na.rm = T) ~ quantile(derived_wage, .01, na.rm = T),
+                                derived_wage > quantile(derived_wage, .99, na.rm = T) ~ quantile(derived_wage, .99, na.rm = T),
+                                T ~ derived_wage)),
+           ## Create controls
+           
+           ### Code education into four levels 
+           derived_educ = factor(ifelse(educ == 1 | educ == 999, NA,
+                                        ## Less than high school
+                                        ifelse(educ <= 60 | educ == 71, 1,
+                                               ## HS degree (include diploma unclear 72)
+                                               ifelse(educ == 70 | educ == 72 | educ == 73, 2,
+                                                      ## Some college
+                                                      ifelse(educ < 110, 3,
+                                                             ## College or more
+                                                             4))))),
+           
+           ### Family status is whether married with spouse present (TRUE),
+           ### other categories (FALSE) or NA
+           derived_married = ifelse(marst == 9, NA, marst == 1),
+           
+           ### Race is white black or other, with later including mixed race
+           derived_race = factor(ifelse(race == 100, 1,
+                                        ifelse(race == 200, 2, 3)),
+                                 labels = c("White","Black","Other")),
+           
+           ## Mother is TRUE if nchild > 0, false otherwise
+           derived_mother = (nchild > 0),
+           
+           ## Filters based on those covariates
+           filter_nonmisseduc = !is.na(derived_educ),
+           filter_nonmisswage = !is.na(derived_ln_wage)
+           ) 
+  
+  ## Variables to include
+  weights_identifiers = c("pernum", "serial", "asecwt",
+                          grep("repwtp", colnames(d_all),
+                               value = TRUE)) 
+  outcome = "derived_ln_wage"
+  treatment = "derived_mother"
+  covariates = c(sprintf("derived_%s", 
+                         c("educ", "married",
+                           "race")), "age")
+  filters = grep("filter", colnames(d_all), value = TRUE)
+  cols_keep = c(weights_identifiers, outcome, treatment, covariates, 
+                filters)
+  
+  d_all <- d_clean %>%
+    select(all_of(cols_keep))
+  
+  write.csv(d_all, sprintf("data/clean/%s", CLEAN_DATA_NAME))
+} else{
+  d_all <- read.csv(sprintf("data/clean/%s", CLEAN_DATA_NAME))
+}
 
-
-
-## next, subset to relevant and further filters
-
-  select(pernum, ln_wage, mother, age, educ, married, race, asecwt, starts_with("repwtp"), starts_with("num")) %>%
-  ## Remove those with missing education
-  filter(!is.na(educ)) %>%
-  mutate(num_with_ed = n())
-
-d <- d_all %>%
-  ## Remove those with missing hourly wages. We estimate models without them
-  filter(!is.na(ln_wage)) %>%
-  mutate(num_with_wage = n())
-
+filter_vars = grep("filter", colnames(d), value = TRUE)
 print("Sample sizes")
-print(d %>%
-        filter(1:n() == 1) %>%
-        select(starts_with("num")))
+colSums(d[, filter_vars])
+
+## Create analytic df (d) for people who pass 
+## all filters (sum of true across filter vars == 
+## length of filter vars)
+d <- d_all[rowSums(d_all[,filter_vars]) == length(filter_vars), ]
 
 ###################################
-# Note the common support problem #
+# Note the common support problem in#
 ###################################
+
+strata_vars = c("age", "derived_educ", "derived_race",
+                     "derived_married")
+treatment_var = "derived_mother"
 
 support_data <- d %>%
-  group_by(age, educ, race, married) %>%
-  mutate(has_support = n_distinct(mother) == 2) %>%
+  
+  ## group by strata of covariates to check support within
+  group_by(across(all_of(strata_vars))) %>%
+  
+  ## indicator variable checking if both levels of 
+  ## treatment var have support (TRUE) otherwise false
+  mutate(has_support = n_distinct(!!sym(treatment_var)) == 2) %>%
   filter(1:n() == 1) %>%
-  select(age, educ, race, married, has_support) %>%
-  right_join(d_all, by = c("age", "educ","race","married")) %>%
+  select(all_of(c(strata_vars, "has_support"))) %>% 
+  
+  ## add support flags onto the main data
+  right_join(d_all, by = strata_vars) %>% 
   mutate(has_support = ifelse(is.na(has_support),F,has_support))
 
 print("Note proportion of mothers and non-mothers in the region of common support")
 print(support_data %>%
-        group_by(mother) %>%
+        group_by(!!sym(treatment_var)) %>%
         summarize(has_support = weighted.mean(has_support, w = asecwt)))
 
 print("Analytical sample is in the region of common support")
 print(paste0("N_Total = ", 
              sum(support_data$has_support)))
 print(paste0("N_Employed = ", 
-             sum(support_data$has_support & !is.na(support_data$ln_wage))))
+             sum(support_data$has_support & !is.na(support_data$derived_ln_wage))))
 
 print("These groups are off the region of common support")
 print(data.frame(support_data %>%
                    filter(!has_support) %>%
-                   select(mother, educ, married, race, age) %>%
-                   arrange(mother, educ, married, race, age)),
+                   select(all_of(c(treatment_var, strata_vars))) %>%
+                   arrange(c(treatment_var, strata_vars))),
       # The max is a very high number to tell it to print all rows
       max = 9999)
 
