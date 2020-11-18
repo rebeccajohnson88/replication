@@ -127,6 +127,9 @@ if(READ_RAW_DATA){
            ## Mother is TRUE if nchild > 0, false otherwise
            derived_mother = (nchild > 0),
            
+           ## For later analysis, create age^squared
+           derived_agesq = age^2,
+           
            ## Filters based on those covariates
            filter_nonmisseduc = !is.na(derived_educ),
            filter_nonmisswage = !is.na(derived_ln_wage)
@@ -140,7 +143,7 @@ if(READ_RAW_DATA){
   treatment = "derived_mother"
   covariates = c(sprintf("derived_%s", 
                          c("educ", "married",
-                           "race")), "age")
+                           "race", "agesq")), "age")
   filters = grep("filter", colnames(d_all), value = TRUE)
   cols_keep = c(weights_identifiers, outcome, treatment, covariates, 
                 filters)
@@ -155,7 +158,7 @@ if(READ_RAW_DATA){
 
 filter_vars = grep("filter", colnames(d), value = TRUE)
 print("Sample sizes")
-colSums(d[, filter_vars])
+colSums(d_all[, filter_vars])
 
 ## Create analytic df (d) for people who pass 
 ## all filters (sum of true across filter vars == 
@@ -200,7 +203,9 @@ print("These groups are off the region of common support")
 print(data.frame(support_data %>%
                    filter(!has_support) %>%
                    select(all_of(c(treatment_var, strata_vars))) %>%
-                   arrange(c(treatment_var, strata_vars))),
+                   arrange(!!!syms(c(treatment_var, strata_vars))) %>%
+                   distinct()), #rj note: i think previous was printing obs without common support; 
+                                # seems like rather than obs we want all groups across the strata vars
       # The max is a very high number to tell it to print all rows
       max = 9999)
 
@@ -208,94 +213,177 @@ print(data.frame(support_data %>%
 
 #################
 # Aggregate gap #
-#################
+################
 
-make_aggregate_results <- function(weight_name) {
-  d_case <- support_data %>% filter(has_support)
-  d_case$weight <- d_case[[weight_name]]
+predict_finddiff <- function(one_model,
+                             df_topred, treatment_varname){
+  
+  ## predict in actual group
+  pred_actual_focal= predict(one_model,
+                             newdata = df_topred)
+  
+  ## predict in contrast group
+  df_topred[[treatment_varname]] <- FALSE
+  pred_actual_other = predict(one_model,
+                              newdata = df_topred)
+  
+  ## estimate is weighted difference between 
+  ## predicted in focal and predicted in contrast
+  ## (in our case, predicted wages for mothers with observed covar 
+  ## values versus predicted wages for nonmothers with observed covar values of 
+  ## mothers)
+  estimate = weighted.mean(pred_actual_focal - pred_actual_other,
+                           w = df_topred$weight)
+  return(estimate)
+}
+
+fit_mods  <- function(full_data, 
+                      filter_flags,
+                      weight_varname,
+                      treatment_varname, outcome_varname,
+                      control_vec) {
+  
+  d_case <- full_data[rowSums(full_data[ , filter_flags]) == length(filter_flags),
+                      ]
+  
+  d_case$weight <- d_case[[weight_varname]]
+  
   # Normalize weights
   d_case$weight <- d_case$weight / sum(d_case$weight)
+  
+  # Separate vector of controls into different combinations (specific to application)
+  control_vec_group = setdiff(control_vec, "derived_agesq")
+  control_vec_interact = c("age", "derived_agesq")
+  
+  # Unadjusted difference in outcomes between tx and control (wages b/t mothers and nonmothers)
   unadjusted <- d_case %>%
-    group_by(mother) %>%
-    summarize(Estimate = weighted.mean(ln_wage, w = weight, na.rm = T)) %>%
-    spread(key = mother, value = Estimate) %>%
+    group_by(!!sym(treatment_varname)) %>%
+    summarize(Estimate = weighted.mean(!!sym(outcome_varname),
+                                       w = weight, na.rm = T), .groups= "drop") %>%
+    spread(key = !!sym(treatment_varname), value = Estimate) %>%
     mutate(approach = "Unadjusted",
            Estimate = `TRUE` - `FALSE`) %>%
     select(approach, Estimate)
-  
+
+  # Adjusted difference in outcomes between treatment and control
+  # defined by strata; weight by n treat in that strata 
   nonparametric_adjusted <- d_case %>%
-    group_by(mother, age, educ, race, married) %>%
-    summarize(estimate = weighted.mean(ln_wage, w = weight, na.rm = T),
-              weight = sum(weight)) %>%
-    group_by(age, educ, race, married) %>%
-    # Give this stratum the weight of mothers in this stratum
-    mutate(weight = sum(weight * mother)) %>%
-    group_by(mother) %>%
-    summarize(Estimate = weighted.mean(estimate, w = weight)) %>%
-    spread(key = mother, value = Estimate) %>%
+    
+    ## First, group by strata defined by treatment varname and control variables
+    group_by(.dots = c(treatment_varname, control_vec_group)) %>%
+    summarize(estimate = weighted.mean(!!sym(outcome_varname), w = weight, na.rm = T),
+              weight = sum(weight), .groups = "drop") %>%
+    
+    ## Then, group by control variables only
+    group_by(.dots = control_vec_group) %>%
+    
+    ## Give each stratum the total weight of treatment == 1 in this stratum
+    mutate(stratum_weight = sum(weight * !!sym(treatment_varname))) %>%
+    
+    ## Then, group by treatment group
+    group_by(!!sym(treatment_varname)) %>%
+    
+    ## Estimate is cell mean weighted by weight for that stratum
+    summarize(Estimate = weighted.mean(estimate, w = stratum_weight),
+              .groups = "drop") %>%
+    
+    ## Reshape to wide form to get mothers (true) - non-mothers (false)
+    spread(key = !!sym(treatment_varname), value = Estimate) %>%
     mutate(approach = "Stratification",
            Estimate = `TRUE` - `FALSE`) %>%
     select(approach, Estimate)
   
-  ols_additive_fit <- lm(ln_wage ~ mother + age + I(age ^ 2) +
-                           educ + race + married,
+  
+  # Model-based approaches
+  
+  ## OLS all vars as additive
+  ols_additive_fit <- lm(formula(sprintf("%s ~ %s + %s",
+                                 outcome_varname,
+                                 treatment_varname,
+                                 paste(control_vec,
+                                   collapse = "+"))),
                          data = d_case,
                          weights = weight)
-  ols_interactive_fit <- lm(ln_wage ~ mother*(age + I(age ^ 2)) +
-                              educ + race + married,
+  
+  ## OLS interact treatment with age and age squared as continuous
+  ols_interactive_fit <- lm(formula(sprintf("%s ~ %s + %s",
+                                    outcome_varname,
+                                    paste(sprintf("%s*%s", 
+                                          treatment_varname, control_vec_interact),
+                                          collapse = "+"),
+                                    paste(control_vec_nointeract,
+                                          collapse = "+"))),
                             data = d_case,
                             weights = weight)
-  ols_ageFactor_fit <- lm(ln_wage ~ mother*(factor(age)) +
-                            educ + race + married,
+  
+  ## OLS interact with age categorical
+  ols_ageFactor_fit <- lm(formula(sprintf("%s ~ %s + %s",
+                                    outcome_varname,
+                                    
+                                    ## interact tx with factor
+                                    sprintf("%s*factor(%s)", 
+                                    treatment_varname, 
+                                    setdiff(control_vec_interact, "derived_agesq")),
+                                    
+                                    ## other controls
+                                    paste(control_vec_nointeract,
+                                    collapse = "+"))),
                           data = d_case,
                           weights = weight)
-  gam_interactive_fit <- gam(ln_wage ~ mother + s(age, by = mother) +
-                               educ + race + married,
-                             data = d_case %>%
-                               group_by() %>%
-                               mutate(mother = factor(mother)),
-                             weight = d_case$weight)
   
-  to_predict <- d_case %>%
-    group_by() %>%
-    filter(mother)
+  ## Gam with group-specific smoother for age
+  ### Needs factor rather than logical vesion of treatment
+  tmp = d_case
+  tmp[[treatment_var]] = factor(tmp[[treatment_var]])
+  gam_interactive_fit <- gam(formula(sprintf("%s ~ %s + s(%s, by = %s) + %s",
+                                    outcome_varname,
+                                    treatment_varname,
+                                    setdiff(control_vec_interact, "derived_agesq"),
+                                    treatment_varname,
+                                    paste(control_vec_nointeract,
+                                    collapse = "+"))),
+                             data = tmp %>% group_by(),
+                             weight = tmp$weight)
   
-  ols_additive_adjusted <- data.frame(
-    approach = "OLS (additive age)",
-    Estimate = weighted.mean(predict(ols_additive_fit, newdata = to_predict %>% mutate(mother = T)) -
-                               predict(ols_additive_fit, newdata = to_predict %>% mutate(mother = F)),
-                             w = to_predict$weight)
-  )
+  # Combine models into a list and generate predictions
+  all_mod = list(ols_additive_fit = ols_additive_fit,
+                 ols_interactive_fit = ols_interactive_fit,
+                 ols_ageFactor_fit = ols_ageFactor_fit,
+                 gam_interactive_fit = gam_interactive_fit)
   
-  ols_interactive_adjusted <- data.frame(
-    approach = "OLS (interactive age)",
-    Estimate = weighted.mean(predict(ols_interactive_fit, newdata = to_predict %>% mutate(mother = T)) -
-                               predict(ols_interactive_fit, newdata = to_predict %>% mutate(mother = F)),
-                             w = to_predict$weight)
-  )
-
-  ols_ageFactor_adjusted <- data.frame(
-    approach = "OLS (age factor)",
-    Estimate = weighted.mean(predict(ols_ageFactor_fit, newdata = to_predict %>% mutate(mother = T)) -
-                               predict(ols_ageFactor_fit, newdata = to_predict %>% mutate(mother = F)),
-                             w = to_predict$weight)
-  )
+  ## filter to whatever group is focal in contrast
+  df_topred = d_case %>% group_by() %>% 
+    filter(!!sym(treatment_varname))
   
-  gam_interactive_adjusted <- data.frame(
-    approach = "GAM (interactive age)",
-    Estimate = weighted.mean(predict(gam_interactive_fit, newdata = to_predict %>% mutate(mother = T)) -
-                               predict(gam_interactive_fit, newdata = to_predict %>% mutate(mother = F)),
-                             w = to_predict$weight)
-  )
+  ## predict
+  all_pred = lapply(all_mod, predict_finddiff, 
+                    df_topred = df_topred,
+                    treatment_varname = treatment_varname)
   
-  return(ols_additive_adjusted %>%
-           bind_rows(ols_interactive_adjusted) %>%
-           bind_rows(ols_ageFactor_adjusted) %>%
-           bind_rows(gam_interactive_adjusted) %>%
-           bind_rows(nonparametric_adjusted))
+  ## bind model-based estimates with each other
+  pred_df = do.call(rbind.data.frame, all_pred)   
+  colnames(pred_df) = "Estimate"
+  pred_df$approach = names(estimate_aggregate_point)
+  
+  ## bind with non-model based estimates
+  all_est = rbind.data.frame(unadjusted, nonparametric_adjusted,
+                             pred_df)
+  
+  return(all_est)
+  
 }
 
-estimate_aggregate_point <- make_aggregate_results("asecwt")
+estimate_aggregate_point <- fit_mods(full_data = support_data,
+                                    filter_flags = c("has_support"),
+                                    weight_varname = "asecwt",
+                                    treatment_varname = "derived_mother",
+                                    outcome_varname = "derived_ln_wage",
+                                    control_vec = c(strata_vars, "derived_agesq"))
+  
+
+
+
+### stopped here
 replicates_aggregate <- foreach(i = 1:160, .combine = "rbind") %do% {
   make_aggregate_results(paste0("repwtp",i))
 }
