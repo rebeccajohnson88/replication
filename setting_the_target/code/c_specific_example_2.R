@@ -44,8 +44,8 @@ print("Output from replication of Wildeman et al.")
 #' 
 #' @param data Dataframe that contains the columns
 #' @param prefix_string String with prefix for scale or gen regex pattern
-#' @param coding_func what to code as yes = true, no = false, and NA
 #' @param verbose whether to print name of items
+#' @param FUN  what to code as yes = true, no = false, and NA
 #' @return vector of length nrow(data) that has scale values (sum of yes on 
 #' indiv items and then averaging over n of items)
 #' One note is that, as structured, if a person is missing any
